@@ -1,38 +1,24 @@
 {
-  "name": "nyayabot",
-  "private": true,
-  "version": "0.0.0",
-  "type": "module",
+  "name": "nyayabot-server",
+  "version": "1.0.0",
+  "description": "NyayaBot AI Legal Assistant - Node.js + Express Backend",
+  "main": "index.js",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "lint": "eslint .",
-    "preview": "vite preview"
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "test": "echo \"No tests yet\" && exit 0"
   },
+  "keywords": ["legal", "ai", "india", "nyayabot"],
+  "author": "NyayaBot Team",
+  "license": "MIT",
+  "type": "commonjs",
   "dependencies": {
-    "axios": "^1.15.0",
-    "framer-motion": "^12.38.0",
-    "leaflet": "^1.9.4",
-    "lucide-react": "^1.8.0",
-    "react": "^19.2.4",
-    "react-dom": "^19.2.4",
-    "react-leaflet": "^5.0.0",
-    "react-markdown": "^10.1.0",
-    "react-router-dom": "^7.14.0",
-    "socket.io-client": "^4.8.3"
-  },
-  "devDependencies": {
-    "@eslint/js": "^9.39.4",
-    "@types/react": "^19.2.14",
-    "@types/react-dom": "^19.2.3",
-    "@vitejs/plugin-react": "^6.0.1",
-    "autoprefixer": "^10.4.27",
-    "eslint": "^9.39.4",
-    "eslint-plugin-react-hooks": "^7.0.1",
-    "eslint-plugin-react-refresh": "^0.5.2",
-    "globals": "^17.4.0",
-    "postcss": "^8.5.9",
-    "tailwindcss": "^3.4.19",
-    "vite": "^8.0.4"
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.1",
+    "express": "^5.2.1",
+    "helmet": "^8.1.0",
+    "morgan": "^1.10.1",
+    "openai": "^6.34.0",
+    "socket.io": "^4.8.3"
   }
 }
