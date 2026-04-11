@@ -3,10 +3,6 @@
 
 const OpenAI = require('openai')
 
-const openai = process.env.OPENAI_API_KEY
-  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
-  : null
-
 const categoryContext = {
   fraud:    'online fraud, cybercrime, UPI fraud, phishing, IT Act 2000, Section 66C, Section 66D',
   police:   'police rights, arrest procedures, bail, CrPC, FIR filing, detention rights',
@@ -154,8 +150,9 @@ module.exports = async function handler(req, res) {
     return res.status(400).json({ error: 'Invalid message.' })
   }
 
-  // No OpenAI key → demo mode
-  if (!openai) {
+  // Create OpenAI client directly from the latest environment variables
+  const openaiKey = process.env.OPENAI_API_KEY;
+  if (!openaiKey) {
     return res.json({
       reply: getDemoResponse(category),
       category,
@@ -163,6 +160,8 @@ module.exports = async function handler(req, res) {
       isDemo: true,
     })
   }
+  
+  const openai = new OpenAI({ apiKey: openaiKey });
 
   try {
     const messages = [
