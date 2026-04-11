@@ -348,7 +348,7 @@ export default function Chat() {
         setMessages(prev => [...prev, {
           id: botId + '-err',
           role: 'bot',
-          text: 'Sorry, I encountered an error connecting to the server. Please make sure the backend is running.\n\n**Quick fix**: Run `cd server && npm run dev` in your terminal.',
+          text: 'Sorry, I encountered an error processing your request. Please try again in a moment.',
           time: new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })
         }])
         setLoading(false)
