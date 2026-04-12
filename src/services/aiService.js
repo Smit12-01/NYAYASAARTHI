@@ -7,7 +7,8 @@
  */
 export async function sendLegalQuery({ message, category, history }) {
   try {
-    const res = await fetch('/api/chat', {
+    const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001'
+    const res = await fetch(`${API_URL}/api/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ message, category, history }),
