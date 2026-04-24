@@ -1,8 +1,7 @@
 // api/chat.js — Vercel Serverless Function
 // This runs on Vercel's edge and calls OpenAI directly.
 
-const OpenAI = require('openai')
-
+// No longer requiring OpenAI, using free Pollinations API
 const categoryContext = {
   fraud:    'online fraud, cybercrime, UPI fraud, phishing, IT Act 2000, Section 66C, Section 66D',
   police:   'police rights, arrest procedures, bail, CrPC, FIR filing, detention rights',
@@ -150,19 +149,6 @@ module.exports = async function handler(req, res) {
     return res.status(400).json({ error: 'Invalid message.' })
   }
 
-  // Create OpenAI client directly from the latest environment variables
-  const openaiKey = process.env.OPENAI_API_KEY;
-  if (!openaiKey) {
-    return res.json({
-      reply: getDemoResponse(category),
-      category,
-      timestamp: new Date().toISOString(),
-      isDemo: true,
-    })
-  }
-  
-  const openai = new OpenAI({ apiKey: openaiKey });
-
   try {
     const messages = [
       { role: 'system', content: getSystemPrompt(category) },
@@ -170,19 +156,27 @@ module.exports = async function handler(req, res) {
       { role: 'user', content: message },
     ]
 
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages,
-      max_tokens: 1200,
-      temperature: 0.3,
+    const response = await fetch('https://text.pollinations.ai/', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        messages,
+        model: 'openai'
+      })
     })
 
-    const reply = completion.choices[0].message.content
+    if (!response.ok) {
+      throw new Error(`Pollinations API error: ${response.statusText}`)
+    }
+
+    const reply = await response.text()
+
     return res.json({
       reply,
       category,
       timestamp: new Date().toISOString(),
-      tokens: completion.usage,
       isDemo: false,
     })
   } catch (err) {

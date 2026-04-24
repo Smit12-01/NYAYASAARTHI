@@ -10,7 +10,6 @@ const navLinks = [
   { to: '/complaint',  label: 'Templates', icon: FileText },
   { to: '/emergency',  label: 'Emergency', icon: AlertTriangle },
   { to: '/about',      label: 'About',     icon: Info },
-  { to: '/team',       label: 'Team',      icon: Users },
 ]
 
 export default function Navbar() {

@@ -5,7 +5,6 @@ import Home from './pages/Home'
 import Chat from './pages/Chat'
 import Emergency from './pages/Emergency'
 import About from './pages/About'
-import Team from './pages/Team'
 import Laws from './pages/Laws'
 import ComplaintTemplate from './pages/ComplaintTemplate'
 
@@ -19,7 +18,6 @@ export default function App() {
           <Route path="/chat"        element={<Chat />} />
           <Route path="/emergency"   element={<Emergency />} />
           <Route path="/about"       element={<About />} />
-          <Route path="/team"        element={<Team />} />
           <Route path="/laws"        element={<Laws />} />
           <Route path="/complaint"   element={<ComplaintTemplate />} />
         </Routes>
