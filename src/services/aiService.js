@@ -1,173 +1,110 @@
-// aiService.js — calls the Vercel serverless /api/chat endpoint
-// No Socket.IO needed; works fully on Vercel's serverless platform.
+// aiService.js — calls Pollinations AI directly from the frontend
+// No API key required. Works everywhere: local, Vercel, Render, etc.
+
+const POLLINATIONS_URL = 'https://text.pollinations.ai/'
+
+const categoryContext = {
+  fraud:    'online fraud, cybercrime, UPI fraud, phishing, IT Act 2000, Section 66C, Section 66D',
+  police:   'police rights, arrest procedures, bail, CrPC, FIR filing, detention rights',
+  rental:   'rental disputes, tenant rights, landlord issues, Rent Control Act, eviction',
+  consumer: 'consumer rights, Consumer Protection Act 2019, NCDRC, product defects',
+  ipc:      'IPC sections, criminal law, offences and penalties',
+  it:       'IT Act 2000, cybercrime law, digital rights',
+  crpc:     'Code of Criminal Procedure, FIR, bail, chargesheet, magistrate',
+  tenant:   'tenant protection, rental agreements, rent courts',
+}
+
+function getSystemPrompt(category) {
+  const context = categoryContext[category] || 'general Indian legal matters'
+  return `You are NyayaSaarthi, an expert AI legal assistant specializing in Indian law.
+
+FOCUS AREA: ${context}
+
+RESPONSE FORMAT (always use this markdown structure):
+## 🔍 Understanding Your Situation
+[2-3 sentence analysis of the legal scenario]
+
+## ⚖️ Applicable Laws & Rights
+- **[Law Name, Section Number]**: Brief explanation of how it applies
+[List 3-5 most relevant laws]
+
+## 🎯 Immediate Action Steps
+1. [Action] — [Why and when, with timeline]
+2. [Continue numbered list]
+
+## 📞 Important Contacts & Resources
+- [Helpline/Authority]: [Contact details]
+
+## ⚠️ Important Notes
+[Key warnings, caveats, when to hire a lawyer]
+
+---
+*Disclaimer: This is general legal information, not professional legal advice. Consult a qualified advocate for your specific case.*
+
+RULES:
+- Only cite REAL Indian laws (IPC, CrPC, IT Act 2000, Constitution, Consumer Protection Act, etc.)
+- If user writes in Hindi, respond primarily in Hindi with English legal terms
+- Always recommend consulting a lawyer for serious criminal matters
+- Be concise, clear, and actionable — not verbose
+- If question is unrelated to law, politely redirect: "I specialise in Indian legal matters..."
+- Never fabricate case law or section numbers`
+}
 
 /**
- * Send a legal query and return the AI response.
- * Falls back to a built-in demo if the API call fails.
+ * Send a legal query and return the AI response directly from Pollinations.
  */
 export async function sendLegalQuery({ message, category, history }) {
-  try {
-    const isProd = import.meta.env.PROD
-    const API_URL = import.meta.env.VITE_API_URL || (isProd ? '' : 'http://localhost:3001')
-    const res = await fetch(`${API_URL}/api/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message, category, history }),
-    })
+  const messages = [
+    { role: 'system', content: getSystemPrompt(category) },
+    ...history.slice(-6).map(h => ({ role: h.role, content: h.content })),
+    { role: 'user', content: message },
+  ]
 
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}))
-      throw new Error(err.error || `HTTP ${res.status}`)
-    }
+  const response = await fetch(POLLINATIONS_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ messages, model: 'openai' }),
+  })
 
-    const data = await res.json()
-    return { success: true, data }
-  } catch (err) {
-    console.error('[aiService] error:', err.message)
-    return {
-      success: false,
-      error: err.message,
-      data: {
-        reply: getFrontendDemo(category),
-        isDemo: true,
-        timestamp: new Date().toISOString(),
-      },
-    }
+  if (!response.ok) {
+    throw new Error(`AI API error: ${response.status} ${response.statusText}`)
+  }
+
+  const reply = await response.text()
+
+  return {
+    success: true,
+    data: {
+      reply,
+      isDemo: false,
+      timestamp: new Date().toISOString(),
+    },
   }
 }
 
 /**
- * streamLegalQuery — wraps sendLegalQuery with the same callback API
- * that Chat.jsx expects (onChunk, onEnd, onError).
- * Since Vercel serverless doesn't support true streaming without extra setup,
- * we simulate a word-by-word reveal for a smooth UX.
+ * streamLegalQuery — calls Pollinations and simulates word-by-word streaming
+ * for a smooth typing effect in the UI.
  */
 export async function streamLegalQuery({ message, category, history, onChunk, onEnd, onError }) {
   try {
     const result = await sendLegalQuery({ message, category, history })
-
-    if (!result.success && !result.data?.reply) {
-      onError({ message: result.error })
-      return
-    }
-
     const { reply, isDemo, timestamp } = result.data
     const words = reply.split(' ')
 
-    // Simulate streaming word-by-word
+    // Simulate streaming word-by-word for smooth UX
     for (let i = 0; i < words.length; i++) {
       onChunk(words[i] + (i < words.length - 1 ? ' ' : ''))
-      await sleep(18)   // ~18ms per word → smooth reveal
+      await sleep(15)
     }
 
     onEnd({ fullReply: reply, isDemo, timestamp })
   } catch (err) {
+    console.error('[aiService] Pollinations API error:', err.message)
     onError({ message: err.message })
   }
 }
 
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms))
-}
-
-// ── Inline demo (shown when API is unreachable) ────────────────────────────
-function getFrontendDemo(category) {
-  const demos = {
-    police: `## 🔍 Understanding Your Situation
-Your query involves police interactions and arrest rights under Indian law. You have strong constitutional protections during any police encounter.
-
-## ⚖️ Applicable Laws & Rights
-- **CrPC Section 50**: Right to be informed of grounds of arrest immediately
-- **CrPC Section 56**: Must be produced before magistrate within 24 hours of arrest
-- **Article 22**: Constitutional right to consult and be defended by a lawyer
-- **D.K. Basu v. State of West Bengal (1997)**: Supreme Court guidelines on arrest
-- **CrPC Section 41A**: Police must issue notice before arrest in many cases
-
-## 🎯 Immediate Action Steps
-1. **At arrest** — Calmly ask: "What is the reason for my arrest?" (your legal right)
-2. **Immediately** — Request to inform one family member or friend (cannot be denied)
-3. **Right now** — Ask for access to your lawyer — this right begins from arrest
-4. **Within 24 hours** — You MUST be presented before a Magistrate; if not, report to NHRC
-5. **After release** — File complaint with Superintendent of Police if rights were violated
-
-## 📞 Important Contacts & Resources
-- 🆘 **Police Control Room**: 100
-- ⚖️ **National Legal Services Authority**: 15100 (free legal aid)
-- 📞 **National Human Rights Commission**: nhrc.nic.in
-- 🏛️ **District Legal Aid**: Free lawyer at trial
-
-## ⚠️ Important Notes
-- Police CANNOT hold you beyond 24 hours without magistrate's remand order
-- You have the right to REMAIN SILENT — statements in custody are admissible
-- Torture or third-degree treatment is illegal — file complaint under IPC 330
-- FIR copy is your legal right — police must provide it free within 24 hours
-
----
-*Disclaimer: This is general legal information, not professional legal advice.*`,
-
-    fraud: `## 🔍 Understanding Your Situation
-Based on your query, this appears to involve online fraud or cybercrime — one of the fastest-growing legal issues in India.
-
-## ⚖️ Applicable Laws & Rights
-- **IT Act 2000, Section 66C**: Identity theft — imprisonment up to 3 years + fine up to ₹1 lakh
-- **IT Act 2000, Section 66D**: Cheating by personation using computer — up to 3 years
-- **IPC Section 420**: Cheating and dishonestly inducing delivery of property
-- **IPC Section 406**: Criminal breach of trust (for investment frauds)
-- **RBI Circular 2017**: Zero liability for unauthorized transactions reported within 3 days
-
-## 🎯 Immediate Action Steps
-1. **Within 1 hour** — Call **1930** (National Cyber Crime Helpline, 24×7)
-2. **Within 3 hours** — Register complaint at **cybercrime.gov.in** (save complaint number)
-3. **Same day** — Visit your bank, request transaction reversal, and submit written complaint
-4. **Within 24 hours** — File FIR at nearest police station under IT Act 66C/66D
-5. **Within 7 days** — Approach Cyber Cell of your city police
-
-## 📞 Important Contacts & Resources
-- 🆘 **Cyber Crime Helpline**: 1930
-- 🌐 **Portal**: cybercrime.gov.in
-- 📱 **RBI Banking Helpline**: 14448
-- 🏛️ **Cyber Crime Police Station**: Available in all major cities
-
-## ⚠️ Important Notes
-- **Preserve all evidence**: Screenshots, transaction IDs, emails, call recordings
-- Banks under RBI mandate must resolve fraud complaints within 90 days
-- For fraud above ₹1 lakh, seriously consider hiring a cybercrime lawyer
-- Do NOT share OTPs or re-engage with the fraudster
-
----
-*Disclaimer: This is general legal information, not professional legal advice.*`,
-
-    rental: `## 🔍 Understanding Your Situation
-Rental disputes in India are governed by state-specific Rent Control Acts and the Model Tenancy Act 2021.
-
-## ⚖️ Applicable Laws & Rights
-- **Model Tenancy Act 2021**: Standard national framework (adopted by many states)
-- **Transfer of Property Act 1882, Sec 105-117**: Governs all lease agreements
-- **State Rent Control Acts**: Delhi RCA, Maharashtra RCA, etc.
-- **IPC Section 441**: Criminal trespass — applies to illegal forced eviction
-- **Consumer Protection Act 2019**: For landlord-builder disputes on new properties
-
-## 🎯 Immediate Action Steps
-1. **Today** — Document everything: photos, receipts, WhatsApp messages, emails
-2. **This week** — Send legal notice via registered post (15-day response period)
-3. **If no response** — File petition with Rent Controller/Rent Court in your district
-4. **For illegal eviction** — File FIR at police station under IPC 441
-5. **Security deposit** — File consumer complaint at DCDRC if landlord refuses within 30 days
-
-## 📞 Important Contacts & Resources
-- 🏛️ **Rent Controller**: Part of your district court
-- ⚖️ **District Consumer Forum (DCDRC)**: For security deposit disputes up to ₹1 crore
-- 📞 **District Legal Services Authority**: Free legal aid available
-
-## ⚠️ Important Notes
-- Security deposit is capped at **2 months rent** under Model Tenancy Act
-- Landlord needs minimum **2 months written notice** before terminating tenancy
-- Unregistered agreements over 11 months lose some legal enforceability
-- Landlord CANNOT cut electricity/water — it's harassment (punishable)
-
----
-*Disclaimer: This is general legal information, not professional legal advice.*`,
-  }
-
-  return demos[category] || demos.fraud
 }
