@@ -154,8 +154,109 @@ app.get('/api/categories', (req, res) => {
 })
 
 // ── WebSocket chat (real-time streaming) ───────────────────────────────────────
+
+// Livestream rooms: roomId → { broadcasterId, viewerIds[] }
+const livestreamRooms = new Map()
+// Viewers who arrived before broadcaster: roomId → [{ socketId, timeout }]
+const pendingViewers  = new Map()
+
 io.on('connection', (socket) => {
-  console.log('Client connected:', socket.id)
+  console.log('[WS] Connected:', socket.id)
+
+  // ── Livestream signaling ──────────────────────────────────────────────────
+
+  // Broadcaster creates a room
+  socket.on('livestream:join', ({ roomId }) => {
+    if (!roomId) return
+    socket.join(roomId)
+    livestreamRooms.set(roomId, { broadcasterId: socket.id, viewerIds: [] })
+    console.log(`[Livestream] Room created: ${roomId} by ${socket.id}`)
+
+    // Notify any viewers who arrived early
+    const pending = pendingViewers.get(roomId) || []
+    pending.forEach(({ viewerId, timeoutHandle }) => {
+      clearTimeout(timeoutHandle)
+      const room = livestreamRooms.get(roomId)
+      if (!room) return
+      room.viewerIds.push(viewerId)
+      // Tell broadcaster about this waiting viewer
+      socket.emit('livestream:viewer-joined', { viewerId })
+      console.log(`[Livestream] Notified broadcaster of pending viewer ${viewerId}`)
+    })
+    pendingViewers.delete(roomId)
+
+    // Confirm room creation back to broadcaster
+    socket.emit('livestream:room-ready', { roomId })
+  })
+
+  // Viewer joins — broadcaster may not be ready yet, so queue them
+  socket.on('livestream:viewer-join', ({ roomId }) => {
+    if (!roomId) return
+    const room = livestreamRooms.get(roomId)
+
+    if (room) {
+      // Broadcaster already here — notify immediately
+      socket.join(roomId)
+      room.viewerIds.push(socket.id)
+      console.log(`[Livestream] Viewer ${socket.id} joined room ${roomId}`)
+      socket.to(room.broadcasterId).emit('livestream:viewer-joined', { viewerId: socket.id })
+    } else {
+      // Broadcaster not ready yet — keep viewer waiting up to 60s
+      console.log(`[Livestream] Viewer ${socket.id} waiting for room ${roomId}`)
+      const timeoutHandle = setTimeout(() => {
+        // Still no broadcaster after 60s → error
+        const stillPending = pendingViewers.get(roomId) || []
+        const remaining = stillPending.filter(v => v.viewerId !== socket.id)
+        if (remaining.length) pendingViewers.set(roomId, remaining)
+        else pendingViewers.delete(roomId)
+        socket.emit('livestream:error', { message: 'Stream not found. Make sure the broadcaster has started the camera.' })
+      }, 60000)
+
+      const list = pendingViewers.get(roomId) || []
+      list.push({ viewerId: socket.id, timeoutHandle })
+      pendingViewers.set(roomId, list)
+      socket.join(roomId)
+
+      // Tell viewer they're waiting
+      socket.emit('livestream:waiting', { message: 'Waiting for broadcaster to start...' })
+    }
+  })
+
+  // Broadcaster → relay offer to specific viewer
+  socket.on('livestream:offer', ({ viewerId, offer }) => {
+    console.log(`[Livestream] Relaying offer to viewer ${viewerId}`)
+    io.to(viewerId).emit('livestream:offer', { offer, broadcasterId: socket.id })
+  })
+
+  // Viewer → relay answer to broadcaster
+  socket.on('livestream:answer', ({ roomId, answer }) => {
+    const room = livestreamRooms.get(roomId)
+    if (room) {
+      console.log(`[Livestream] Relaying answer from viewer ${socket.id}`)
+      io.to(room.broadcasterId).emit('livestream:answer', { answer, viewerId: socket.id })
+    }
+  })
+
+  // ICE candidates — relay to specific target
+  socket.on('livestream:ice-candidate', ({ roomId, candidate, targetId }) => {
+    if (targetId) {
+      io.to(targetId).emit('livestream:ice-candidate', { candidate, fromId: socket.id })
+    } else {
+      socket.to(roomId).emit('livestream:ice-candidate', { candidate, fromId: socket.id })
+    }
+  })
+
+  // Broadcaster ends the stream explicitly
+  socket.on('livestream:end', ({ roomId }) => {
+    socket.to(roomId).emit('livestream:ended')
+    livestreamRooms.delete(roomId)
+    const pending = pendingViewers.get(roomId) || []
+    pending.forEach(({ timeoutHandle }) => clearTimeout(timeoutHandle))
+    pendingViewers.delete(roomId)
+    console.log(`[Livestream] Room ${roomId} ended by broadcaster`)
+  })
+
+  // ── Chat streaming ────────────────────────────────────────────────────────
 
   socket.on('chat:message', async ({ message, category, history = [] }) => {
     if (!message || message.length > 1000) return
@@ -189,7 +290,7 @@ io.on('connection', (socket) => {
         const words = demo.split(' ')
         for (let i = 0; i < words.length; i++) {
           socket.emit('chat:stream', words[i] + ' ')
-          await new Promise(r => setTimeout(r, 30)) // Smooth simulation
+          await new Promise(r => setTimeout(r, 30))
         }
         socket.emit('chat:end', { fullReply: demo, isDemo: true })
       }
@@ -200,7 +301,30 @@ io.on('connection', (socket) => {
   })
 
   socket.on('disconnect', () => {
-    console.log('Client disconnected:', socket.id)
+    console.log('[WS] Disconnected:', socket.id)
+    for (const [roomId, room] of livestreamRooms.entries()) {
+      if (room.broadcasterId === socket.id) {
+        socket.to(roomId).emit('livestream:ended')
+        livestreamRooms.delete(roomId)
+        // Also clear any still-pending viewers for this room
+        const pending = pendingViewers.get(roomId) || []
+        pending.forEach(({ timeoutHandle }) => clearTimeout(timeoutHandle))
+        pendingViewers.delete(roomId)
+        console.log(`[Livestream] Room ${roomId} auto-closed (broadcaster left)`)
+      } else {
+        room.viewerIds = room.viewerIds.filter(id => id !== socket.id)
+      }
+    }
+    // Clean up if this was a pending viewer
+    for (const [roomId, list] of pendingViewers.entries()) {
+      const found = list.find(v => v.viewerId === socket.id)
+      if (found) {
+        clearTimeout(found.timeoutHandle)
+        const remaining = list.filter(v => v.viewerId !== socket.id)
+        if (remaining.length) pendingViewers.set(roomId, remaining)
+        else pendingViewers.delete(roomId)
+      }
+    }
   })
 })
 

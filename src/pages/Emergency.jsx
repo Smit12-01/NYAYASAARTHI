@@ -1,11 +1,13 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
   Phone, MessageSquare, MapPin, AlertTriangle,
   Navigation, Copy, Check, ExternalLink, Share2,
-  Wifi, WifiOff, RefreshCw, Settings, ChevronDown, ChevronUp
+  Wifi, WifiOff, RefreshCw, Settings, ChevronDown, ChevronUp,
+  Camera, VideoOff, StopCircle, Radio
 } from 'lucide-react'
 import { MapContainer, TileLayer, Marker, Popup, Circle, useMap } from 'react-leaflet'
+import { io } from 'socket.io-client'
 import 'leaflet/dist/leaflet.css'
 import L from 'leaflet'
 
@@ -33,6 +35,10 @@ const HELPLINES = [
   { name: 'Legal Aid (NALSA)', number: '15100', color: 'from-emerald-600 to-emerald-800', emoji: '⚖️' },
   { name: 'NHRC',              number: '14433', color: 'from-indigo-600 to-indigo-800',   emoji: '🏛️' },
 ]
+
+/* ─── WebRTC config ─── */
+const STUN = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }] }
+const SERVER_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001'
 
 /* ─── Map fly-to helper ─── */
 function MapFlyTo({ pos }) {
@@ -180,6 +186,20 @@ export default function Emergency() {
   const [shareUrl, setShareUrl]         = useState('')
   const watchRef                        = useRef(null)
 
+  // ── Livestream state ──────────────────────────────────────────────────────
+  const [streaming, setStreaming]         = useState(false)
+  const [signalingReady, setSignalingReady] = useState(false) // server confirmed room
+  const [streamLink, setStreamLink]       = useState('')
+  const [streamCopied, setStreamCopied]   = useState(false)
+  const [streamError, setStreamError]     = useState('')
+  const [viewerCount, setViewerCount]     = useState(0)
+  const localVideoRef                     = useRef(null)
+  const socketRef                         = useRef(null)
+  const peersRef                          = useRef({})          // viewerId → RTCPeerConnection
+  const iceCacheRef                       = useRef({})          // viewerId → candidate[]
+  const localStreamRef                    = useRef(null)
+  const roomIdRef                         = useRef(null)
+
   useEffect(() => {
     const on  = () => setOnline(true)
     const off = () => setOnline(false)
@@ -254,6 +274,150 @@ export default function Emergency() {
   }
 
   useEffect(() => () => { if (watchRef.current) navigator.geolocation.clearWatch(watchRef.current) }, [])
+
+  // \u2500\u2500 Livestream helpers \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+  const stopLivestream = useCallback(() => {
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach(t => t.stop())
+      localStreamRef.current = null
+    }
+    Object.values(peersRef.current).forEach(pc => pc.close())
+    peersRef.current  = {}
+    iceCacheRef.current = {}
+    if (socketRef.current) {
+      socketRef.current.emit('livestream:end', { roomId: roomIdRef.current })
+      socketRef.current.disconnect()
+      socketRef.current = null
+    }
+    roomIdRef.current = null
+    setStreaming(false)
+    setSignalingReady(false)
+    setStreamLink('')
+    setViewerCount(0)
+    setStreamError('')
+    showToast('📷 Livestream ended')
+  }, [])
+
+  const startLivestream = useCallback(async () => {
+    setStreamError('')
+    try {
+      // ── Step 1: Open camera ──────────────────────────────────────────────
+      let stream
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: true })
+      } catch {
+        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+      }
+      localStreamRef.current = stream
+
+      // ── Step 2: Generate link + show video IMMEDIATELY ───────────────────
+      const roomId = crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2)
+      roomIdRef.current = roomId
+      const link = `${window.location.origin}/livestream/${roomId}`
+      setStreamLink(link)   // link appears right away
+      setStreaming(true)     // mounts the video element so useEffect can attach stream
+      showToast('📷 Camera live! Share the link below.')
+
+      // ── Step 3: Connect signaling server in background ───────────────────
+      try { await fetch(`${SERVER_URL}/health`) } catch {}  // wake Render free tier
+
+      const socket = io(SERVER_URL, { transports: ['polling', 'websocket'] })
+      socketRef.current = socket
+
+      socket.on('connect_error', (err) => {
+        console.error('[Signaling] connect error', err.message)
+        // Don't kill stream on signaling error — camera still works
+        setSignalingReady(false)
+      })
+
+      socket.on('connect', () => {
+        console.log('[Signaling] Connected, joining room', roomId)
+        socket.emit('livestream:join', { roomId })
+        setSignalingReady(true)  // mark ready on connect (works with old server too)
+      })
+
+      // New server: also responds with room-ready (no-op if already set above)
+      socket.on('livestream:room-ready', () => setSignalingReady(true))
+
+      // ── Step 4: New viewer joined — create WebRTC offer ───────────────────
+      socket.on('livestream:viewer-joined', async ({ viewerId }) => {
+        console.log('[WebRTC] Viewer joined:', viewerId)
+        setViewerCount(c => c + 1)
+
+        const pc = new RTCPeerConnection(STUN)
+        peersRef.current[viewerId] = pc
+        iceCacheRef.current[viewerId] = []
+
+        stream.getTracks().forEach(track => pc.addTrack(track, stream))
+
+        pc.onicecandidate = ({ candidate }) => {
+          if (candidate) {
+            socket.emit('livestream:ice-candidate', {
+              roomId: roomIdRef.current, candidate, targetId: viewerId,
+            })
+          }
+        }
+
+        pc.onconnectionstatechange = () =>
+          console.log(`[WebRTC] Peer ${viewerId} → ${pc.connectionState}`)
+
+        const offer = await pc.createOffer()
+        await pc.setLocalDescription(offer)
+        socket.emit('livestream:offer', { roomId: roomIdRef.current, viewerId, offer })
+        console.log('[WebRTC] Offer sent to:', viewerId)
+      })
+
+      // ── Step 5: Viewer answered ───────────────────────────────────────────
+      socket.on('livestream:answer', async ({ answer, viewerId }) => {
+        const pc = peersRef.current[viewerId]
+        if (!pc) return
+        await pc.setRemoteDescription(new RTCSessionDescription(answer))
+        const cached = iceCacheRef.current[viewerId] || []
+        for (const c of cached) {
+          try { await pc.addIceCandidate(new RTCIceCandidate(c)) } catch {}
+        }
+        iceCacheRef.current[viewerId] = []
+      })
+
+      // ── Step 6: ICE candidates from viewer (with queuing) ────────────────
+      socket.on('livestream:ice-candidate', async ({ candidate, fromId }) => {
+        const pc = peersRef.current[fromId]
+        if (!pc || !candidate) return
+        if (pc.remoteDescription) {
+          try { await pc.addIceCandidate(new RTCIceCandidate(candidate)) } catch {}
+        } else {
+          iceCacheRef.current[fromId] = iceCacheRef.current[fromId] || []
+          iceCacheRef.current[fromId].push(candidate)
+        }
+      })
+
+      socket.on('disconnect', () => {
+        console.log('[Signaling] Disconnected')
+        setSignalingReady(false)
+      })
+
+    } catch (err) {
+      console.error('[Livestream] error:', err)
+      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+        setStreamError('Camera permission denied. Please allow camera access and try again.')
+      } else {
+        setStreamError('Could not start camera: ' + err.message)
+      }
+      setStreaming(false)
+    }
+  }, [stopLivestream])
+
+  // Cleanup on unmount
+  useEffect(() => () => stopLivestream(), [stopLivestream])
+
+  // Attach camera stream to video element once it renders in the DOM
+  useEffect(() => {
+    if (streaming && localVideoRef.current && localStreamRef.current) {
+      localVideoRef.current.srcObject = localStreamRef.current
+      localVideoRef.current.play().catch(() => {})
+    }
+  }, [streaming])
 
   const handleManualSet = (coords) => {
     setLocation(coords)
@@ -344,15 +508,148 @@ export default function Emergency() {
               <p className="text-slate-400 text-xs">Call 112 (All emergencies) or 100 (Police)</p>
             </div>
           </div>
-          <div className="flex gap-2 w-full sm:w-auto">
+          <div className="flex gap-2 w-full sm:w-auto flex-wrap">
             <a href="tel:112" className="flex-1 sm:flex-none flex items-center justify-center gap-2 bg-red-600 hover:bg-red-500 text-white text-sm font-bold px-5 py-2.5 rounded-xl transition-colors shadow-lg shadow-red-600/20">
               <Phone size={14} /> Call 112
             </a>
             <button onClick={sendSOS} className="flex-1 sm:flex-none flex items-center justify-center gap-2 bg-orange-600 hover:bg-orange-500 text-white text-sm font-bold px-4 py-2.5 rounded-xl transition-colors">
               <MessageSquare size={14} /> SOS SMS
             </button>
+            {!streaming ? (
+              <button
+                id="start-livestream-btn"
+                onClick={startLivestream}
+                className="flex-1 sm:flex-none flex items-center justify-center gap-2 bg-gradient-to-r from-violet-600 to-purple-700 hover:from-violet-500 hover:to-purple-600 text-white text-sm font-bold px-4 py-2.5 rounded-xl transition-all shadow-lg shadow-purple-600/20"
+              >
+                <Camera size={14} /> Live Camera
+              </button>
+            ) : (
+              <button
+                id="stop-livestream-btn"
+                onClick={stopLivestream}
+                className="flex-1 sm:flex-none flex items-center justify-center gap-2 bg-gradient-to-r from-red-600 to-rose-700 hover:from-red-500 hover:to-rose-600 text-white text-sm font-bold px-4 py-2.5 rounded-xl transition-all animate-pulse"
+              >
+                <StopCircle size={14} /> Stop Stream
+              </button>
+            )}
           </div>
         </div>
+
+        {/* Livestream Card */}
+        <AnimatePresence>
+          {(streaming || streamError) && (
+            <motion.div
+              initial={{ opacity: 0, y: -12 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -12 }}
+              className="mb-5"
+            >
+              <div className="glass-card border border-purple-500/40 overflow-hidden">
+                {/* Card header */}
+                <div className="px-4 py-3 bg-gradient-to-r from-violet-600/20 to-purple-700/20 border-b border-purple-500/20 flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Radio size={14} className="text-purple-400 animate-pulse" />
+                    <span className="text-white font-semibold text-sm">Emergency Livestream</span>
+                    {streaming && signalingReady && (
+                      <span className="flex items-center gap-1 bg-red-500/20 border border-red-500/30 text-red-400 text-[10px] font-bold px-2 py-0.5 rounded-full">
+                        <span className="w-1.5 h-1.5 rounded-full bg-red-400 animate-pulse inline-block" />
+                        LIVE
+                      </span>
+                    )}
+                    {streaming && !signalingReady && (
+                      <span className="flex items-center gap-1.5 text-slate-400 text-[10px]">
+                        <div className="w-2.5 h-2.5 border border-slate-400/30 border-t-slate-400 rounded-full animate-spin" />
+                        Connecting to server…
+                      </span>
+                    )}
+                  </div>
+                  {viewerCount > 0 && (
+                    <span className="text-purple-300 text-xs">👁 {viewerCount} viewer{viewerCount !== 1 ? 's' : ''}</span>
+                  )}
+                </div>
+
+                <div className="p-4 grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  {/* Video preview */}
+                  <div className="relative rounded-xl overflow-hidden bg-black aspect-video">
+                    <video
+                      ref={localVideoRef}
+                      autoPlay
+                      muted
+                      playsInline
+                      className="w-full h-full object-cover"
+                    />
+                    {streaming && (
+                      <div className="absolute top-2 left-2 flex items-center gap-1.5 bg-red-600/90 text-white text-[10px] font-bold px-2 py-1 rounded-full backdrop-blur-sm">
+                        <span className="w-1.5 h-1.5 bg-white rounded-full animate-pulse" /> LIVE
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Share link */}
+                  <div className="flex flex-col justify-between gap-3">
+                    <div>
+                      <p className="text-slate-400 text-xs mb-1.5 font-medium">📎 Share this link to let others watch:</p>
+                      <div className="bg-slate-800/80 border border-slate-700 rounded-xl p-3">
+                        <p className="text-purple-300 text-xs font-mono break-all leading-relaxed">{streamLink}</p>
+                      </div>
+                      {/* Warn if localhost — won't work on other devices */}
+                      {window.location.hostname === 'localhost' && (
+                        <div className="mt-2 bg-amber-500/10 border border-amber-500/30 rounded-lg p-2.5">
+                          <p className="text-amber-400 text-[10px] font-semibold mb-1">⚠️ Localhost detected</p>
+                          <p className="text-amber-300/80 text-[10px] leading-relaxed">
+                            This link only works on <strong>this computer</strong>.<br />
+                            For other devices, replace <code className="bg-amber-500/20 px-1 rounded">localhost</code> with your network IP.<br />
+                            Check your terminal — it shows: <code className="bg-amber-500/20 px-1 rounded">Network: http://10.x.x.x:5173</code><br />
+                            Then use: <span className="text-amber-300 font-mono">http://10.x.x.x:5173/livestream/...</span>
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <button
+                        id="copy-stream-link-btn"
+                        onClick={() => {
+                          navigator.clipboard.writeText(streamLink)
+                          setStreamCopied(true)
+                          showToast('🔗 Stream link copied!')
+                          setTimeout(() => setStreamCopied(false), 2500)
+                        }}
+                        className="flex items-center justify-center gap-1.5 bg-purple-600/20 border border-purple-500/30 hover:bg-purple-600/30 text-purple-300 text-xs py-2.5 rounded-xl transition-all"
+                      >
+                        {streamCopied ? <Check size={12} className="text-green-400" /> : <Copy size={12} />}
+                        {streamCopied ? 'Copied!' : 'Copy Link'}
+                      </button>
+                      {navigator.share && (
+                        <button
+                          id="share-stream-link-btn"
+                          onClick={() => navigator.share({ title: '🆘 Emergency Live Stream', text: 'Watch my emergency livestream', url: streamLink }).catch(() => {})}
+                          className="flex items-center justify-center gap-1.5 bg-violet-600 hover:bg-violet-500 text-white text-xs py-2.5 rounded-xl transition-all"
+                        >
+                          <Share2 size={12} /> Share
+                        </button>
+                      )}
+                    </div>
+                    <button
+                      onClick={stopLivestream}
+                      className="w-full flex items-center justify-center gap-2 bg-red-600/20 border border-red-500/30 hover:bg-red-600/30 text-red-400 text-xs py-2.5 rounded-xl transition-all"
+                    >
+                      <StopCircle size={12} /> Stop Livestream
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </motion.div>
+          )}
+          {streamError && !streaming && (
+            <motion.div
+              initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+              className="mb-5 bg-red-500/10 border border-red-500/30 rounded-xl p-4 flex items-center gap-3"
+            >
+              <VideoOff size={16} className="text-red-400 flex-shrink-0" />
+              <p className="text-red-300 text-sm">{streamError}</p>
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
 
