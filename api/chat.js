@@ -1,7 +1,8 @@
 // api/chat.js — Vercel Serverless Function
-// This runs on Vercel's edge and calls OpenAI directly.
+// Primary: Gemini 1.5 Flash (via GEMINI_API_KEY env var on Vercel)
+// Fallback: Pollinations free API
+// Fallback 2: Demo response (always works)
 
-// No longer requiring OpenAI, using free Pollinations API
 const categoryContext = {
   fraud:    'online fraud, cybercrime, UPI fraud, phishing, IT Act 2000, Section 66C, Section 66D',
   police:   'police rights, arrest procedures, bail, CrPC, FIR filing, detention rights',
@@ -118,9 +119,9 @@ Based on your query, this appears to involve online fraud or cybercrime — one 
   return demos[category] || demos.fraud
 }
 
-// Simple in-memory rate limit (resets per serverless instance)
+// ── Rate limiting ──────────────────────────────────────────────────────────────
 const rateMap = new Map()
-function rateLimit(ip, limit = 15, windowMs = 60000) {
+function rateLimit(ip, limit = 20, windowMs = 60000) {
   const now = Date.now()
   const rec = rateMap.get(ip) || { count: 0, reset: now + windowMs }
   if (now > rec.reset) { rec.count = 0; rec.reset = now + windowMs }
@@ -129,9 +130,45 @@ function rateLimit(ip, limit = 15, windowMs = 60000) {
   return rec.count <= limit
 }
 
+// ── Gemini AI call ─────────────────────────────────────────────────────────────
+async function callGemini(systemPrompt, history, userMessage) {
+  const { GoogleGenerativeAI } = await import('@google/generative-ai')
+  const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
+  const model = genAI.getGenerativeModel({
+    model: 'gemini-1.5-flash',
+    systemInstruction: systemPrompt,
+  })
+
+  // Build history for multi-turn conversation
+  const chatHistory = history.slice(-6).map(h => ({
+    role: h.role === 'user' ? 'user' : 'model',
+    parts: [{ text: h.content }],
+  }))
+
+  const chat = model.startChat({ history: chatHistory })
+  const result = await chat.sendMessage(userMessage)
+  return result.response.text()
+}
+
+// ── Pollinations fallback ──────────────────────────────────────────────────────
+async function callPollinations(systemPrompt, history, userMessage) {
+  const messages = [
+    { role: 'system', content: systemPrompt },
+    ...history.slice(-6).map(h => ({ role: h.role, content: h.content })),
+    { role: 'user', content: userMessage },
+  ]
+  const response = await fetch('https://text.pollinations.ai/', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ messages, model: 'openai' }),
+  })
+  if (!response.ok) throw new Error(`Pollinations ${response.status}: ${response.statusText}`)
+  return response.text()
+}
+
+// ── Main handler ───────────────────────────────────────────────────────────────
 module.exports = async function handler(req, res) {
-  // CORS
-  res.setHeader('Access-Control-Allow-Origin', '*')
+  res.setHeader('Access-Control-Allow-Origin', 'https://nyayasaarthi.vercel.app')
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS')
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
 
@@ -140,53 +177,60 @@ module.exports = async function handler(req, res) {
 
   const ip = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown'
   if (!rateLimit(ip)) {
-    return res.status(429).json({ error: 'Rate limit exceeded. Please wait 1 minute.' })
+    return res.status(429).json({ error: 'Too many requests. Please wait 1 minute.' })
   }
 
   const { message, category = 'fraud', history = [] } = req.body || {}
 
-  if (!message || typeof message !== 'string' || message.length > 1000) {
-    return res.status(400).json({ error: 'Invalid message.' })
+  if (!message || typeof message !== 'string' || message.trim().length === 0) {
+    return res.status(400).json({ error: 'Message is required.' })
+  }
+  if (message.length > 1000) {
+    return res.status(400).json({ error: 'Message too long (max 1000 characters).' })
   }
 
-  try {
-    const messages = [
-      { role: 'system', content: getSystemPrompt(category) },
-      ...history.slice(-6).map(h => ({ role: h.role, content: h.content })),
-      { role: 'user', content: message },
-    ]
+  const systemPrompt = getSystemPrompt(category)
+  let reply = null
+  let isDemo = false
+  let usedEngine = ''
 
-    const response = await fetch('https://text.pollinations.ai/', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        messages,
-        model: 'openai'
-      })
-    })
-
-    if (!response.ok) {
-      throw new Error(`Pollinations API error: ${response.statusText}`)
+  // ── Try Gemini first ────────────────────────────────────────────────────────
+  if (process.env.GEMINI_API_KEY) {
+    try {
+      reply = await callGemini(systemPrompt, history, message)
+      usedEngine = 'gemini'
+      console.log(`[Chat] ✅ Gemini responded (${reply.length} chars)`)
+    } catch (err) {
+      console.error('[Chat] ❌ Gemini failed:', err.message)
     }
-
-    const reply = await response.text()
-
-    return res.json({
-      reply,
-      category,
-      timestamp: new Date().toISOString(),
-      isDemo: false,
-    })
-  } catch (err) {
-    console.error('[OpenAI Error]', err.message)
-    return res.json({
-      reply: getDemoResponse(category),
-      category,
-      timestamp: new Date().toISOString(),
-      isDemo: true,
-      error: 'AI temporarily unavailable — showing demo response',
-    })
+  } else {
+    console.warn('[Chat] ⚠️  GEMINI_API_KEY not set — skipping Gemini')
   }
+
+  // ── Fallback: Pollinations ──────────────────────────────────────────────────
+  if (!reply) {
+    try {
+      reply = await callPollinations(systemPrompt, history, message)
+      usedEngine = 'pollinations'
+      console.log(`[Chat] ✅ Pollinations responded (${reply.length} chars)`)
+    } catch (err) {
+      console.error('[Chat] ❌ Pollinations failed:', err.message)
+    }
+  }
+
+  // ── Fallback: Demo response ─────────────────────────────────────────────────
+  if (!reply) {
+    reply = getDemoResponse(category)
+    isDemo = true
+    usedEngine = 'demo'
+    console.log('[Chat] ⚠️  Using demo response (both AI engines unavailable)')
+  }
+
+  return res.json({
+    reply,
+    category,
+    isDemo,
+    engine: usedEngine,
+    timestamp: new Date().toISOString(),
+  })
 }

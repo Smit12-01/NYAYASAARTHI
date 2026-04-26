@@ -4,7 +4,6 @@ const helmet     = require('helmet')
 const morgan     = require('morgan')
 const http       = require('http')
 const { Server } = require('socket.io')
-const OpenAI     = require('openai')
 require('dotenv').config()
 
 const app = express()
@@ -46,9 +45,15 @@ app.use(cors(corsOptions))
 app.use(morgan('dev'))
 app.use(express.json({ limit: '10mb' }))
 
-// ── OpenAI client ─────────────────────────────────────────────────────────────
+// ── AI clients (lazy-loaded) ──────────────────────────────────────────────────
+function getGemini() {
+  if (!process.env.GEMINI_API_KEY) return null
+  const { GoogleGenerativeAI } = require('@google/generative-ai')
+  return new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
+}
+
 const openai = process.env.OPENAI_API_KEY
-  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+  ? (() => { const OpenAI = require('openai'); return new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) })()
   : null
 
 // ── System prompt ─────────────────────────────────────────────────────────────
@@ -110,65 +115,126 @@ function rateLimit(ip, limit = 20, window = 60000) {
   return record.count <= limit
 }
 
+// ── Root health ───────────────────────────────────────────────────────────────
+app.get('/', (req, res) => {
+  res.json({ status: 'ok', service: 'NyayaSaarthi API', version: '1.0.0' })
+})
+
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     service: 'NyayaSaarthi API',
     version: '1.0.0',
-    aiEnabled: !!openai,
+    gemini:  !!process.env.GEMINI_API_KEY,
+    openai:  !!openai,
     timestamp: new Date().toISOString(),
   })
 })
 
-// ── Chat endpoint ─────────────────────────────────────────────────────────────
-app.post('/api/chat', async (req, res) => {
-  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress
+// ── AI chat handler (Gemini → Pollinations → demo) ────────────────────────────
+async function handleAiChat(req, res) {
+  const ip = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown'
   if (!rateLimit(ip)) {
     return res.status(429).json({ error: 'Rate limit exceeded. Please wait 1 minute.' })
   }
 
-  const { message, category = 'fraud', history = [] } = req.body
+  const { message, category = 'fraud', history = [] } = req.body || {}
 
-  if (!message || typeof message !== 'string' || message.length > 1000) {
-    return res.status(400).json({ error: 'Invalid message. Must be a string under 1000 characters.' })
+  if (!message || typeof message !== 'string' || message.trim().length === 0) {
+    return res.status(400).json({ error: 'Message is required.' })
+  }
+  if (message.length > 1000) {
+    return res.status(400).json({ error: 'Message too long (max 1000 characters).' })
   }
 
-  // If no OpenAI key, return demo
-  if (!openai) {
-    return res.json(getDemoResponse(message, category))
+  const systemPrompt = getSystemPrompt(category)
+  let reply = null
+  let isDemo = false
+  let engine = ''
+
+  // 1️⃣ Try Gemini
+  const gemini = getGemini()
+  if (gemini) {
+    try {
+      const model = gemini.getGenerativeModel({
+        model: 'gemini-1.5-flash',
+        systemInstruction: systemPrompt,
+      })
+      const chatHistory = history.slice(-6).map(h => ({
+        role: h.role === 'user' ? 'user' : 'model',
+        parts: [{ text: h.content }],
+      }))
+      const chat = model.startChat({ history: chatHistory })
+      const result = await chat.sendMessage(message)
+      reply = result.response.text()
+      engine = 'gemini'
+      console.log(`[AI] ✅ Gemini responded (${reply.length} chars)`)
+    } catch (err) {
+      console.error('[AI] ❌ Gemini failed:', err.message)
+    }
+  } else {
+    console.warn('[AI] ⚠️  GEMINI_API_KEY not set')
   }
 
-  try {
-    const messages = [
-      { role: 'system', content: getSystemPrompt(category) },
-      ...history.slice(-6).map(h => ({ role: h.role, content: h.content })),
-      { role: 'user', content: message },
-    ]
-
-    const completion = await openai.chat.completions.create({
-      model:       'gpt-4o-mini',
-      messages,
-      max_tokens:  1200,
-      temperature: 0.3,   // Low temp for consistent, accurate legal info
-      stream:      false,
-    })
-
-    const reply = completion.choices[0].message.content
-
-    res.json({
-      reply,
-      category,
-      timestamp: new Date().toISOString(),
-      tokens:    completion.usage,
-      isDemo:    false,
-    })
-  } catch (err) {
-    console.error('[OpenAI Error]', err.message)
-    // Fallback to demo on API error
-    res.json({ ...getDemoResponse(message, category), error: 'AI temporarily unavailable — showing demo response' })
+  // 2️⃣ Try OpenAI
+  if (!reply && openai) {
+    try {
+      const messages = [
+        { role: 'system', content: systemPrompt },
+        ...history.slice(-6).map(h => ({ role: h.role, content: h.content })),
+        { role: 'user', content: message },
+      ]
+      const completion = await openai.chat.completions.create({
+        model: 'gpt-4o-mini', messages, max_tokens: 1200, temperature: 0.3,
+      })
+      reply = completion.choices[0].message.content
+      engine = 'openai'
+      console.log(`[AI] ✅ OpenAI responded`)
+    } catch (err) {
+      console.error('[AI] ❌ OpenAI failed:', err.message)
+    }
   }
-})
+
+  // 3️⃣ Try Pollinations (free fallback)
+  if (!reply) {
+    try {
+      const messages = [
+        { role: 'system', content: systemPrompt },
+        ...history.slice(-6).map(h => ({ role: h.role, content: h.content })),
+        { role: 'user', content: message },
+      ]
+      const pollRes = await fetch('https://text.pollinations.ai/', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages, model: 'openai' }),
+      })
+      if (pollRes.ok) {
+        reply = await pollRes.text()
+        engine = 'pollinations'
+        console.log(`[AI] ✅ Pollinations responded`)
+      } else {
+        throw new Error(`Pollinations ${pollRes.status}`)
+      }
+    } catch (err) {
+      console.error('[AI] ❌ Pollinations failed:', err.message)
+    }
+  }
+
+  // 4️⃣ Demo fallback — always works
+  if (!reply) {
+    const demo = getDemoResponse(message, category)
+    reply = demo.reply
+    isDemo = true
+    engine = 'demo'
+    console.log('[AI] ⚠️  Using demo response')
+  }
+
+  return res.json({ reply, category, isDemo, engine, timestamp: new Date().toISOString() })
+}
+
+app.post('/api/chat', handleAiChat)
+app.post('/api/ask',  handleAiChat)  // alias used by some frontend versions
 
 // ── Categories endpoint ───────────────────────────────────────────────────────
 app.get('/api/categories', (req, res) => {
