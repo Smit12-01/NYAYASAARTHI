@@ -38,7 +38,7 @@ const HELPLINES = [
 
 /* ─── WebRTC config ─── */
 const STUN = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }] }
-const SERVER_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001'
+const SERVER_URL = import.meta.env.VITE_STREAM_SERVER_URL || 'https://nyayabot-backend.onrender.com'
 
 /* ─── Map fly-to helper ─── */
 function MapFlyTo({ pos }) {

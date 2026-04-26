@@ -7,15 +7,38 @@ const { Server } = require('socket.io')
 const OpenAI     = require('openai')
 require('dotenv').config()
 
-const app    = express()
+const app = express()
+
+// ── CORS origins ──────────────────────────────────────────────────────────────
+const ALLOWED_ORIGINS = [
+  'https://nyayasaarthi.vercel.app',
+  /https:\/\/nyayasaarthi.*\.vercel\.app/,
+  'http://localhost:5173',
+  'http://localhost:5174',
+  'http://localhost:3000',
+  process.env.CLIENT_URL,
+].filter(Boolean)
+
+const corsOptions = {
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true)
+    const ok = ALLOWED_ORIGINS.some(o =>
+      typeof o === 'string' ? o === origin : o.test(origin)
+    )
+    cb(ok ? null : new Error(`CORS blocked: ${origin}`), ok)
+  },
+  methods: ['GET', 'POST', 'OPTIONS'],
+  credentials: true,
+}
+
 const server = http.createServer(app)
 const io     = new Server(server, {
-  cors: { origin: '*', methods: ['GET', 'POST'] }
+  cors: { origin: ALLOWED_ORIGINS, methods: ['GET', 'POST'], credentials: true }
 })
 
 // ── Middleware ────────────────────────────────────────────────────────────────
 app.use(helmet({ contentSecurityPolicy: false }))
-app.use(cors({ origin: '*' }))
+app.use(cors(corsOptions))
 app.use(morgan('dev'))
 app.use(express.json({ limit: '10mb' }))
 

@@ -11,7 +11,7 @@ const STUN = {
     { urls: 'stun:stun2.l.google.com:19302' },
   ]
 }
-const SERVER_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001'
+const SERVER_URL = import.meta.env.VITE_STREAM_SERVER_URL || 'https://nyayabot-backend.onrender.com'
 
 export default function LivestreamViewer() {
   const { roomId } = useParams()
