@@ -344,11 +344,11 @@ export default function Chat() {
         setLoading(false)
         inputRef.current?.focus()
       },
-      onError: () => {
+      onError: (err) => {
         setMessages(prev => [...prev, {
-          id: botId + '-err',
+          id:   botId + '-err',
           role: 'bot',
-          text: 'Sorry, I encountered an error processing your request. Please try again in a moment.',
+          text: `⚠️ **Error:** ${err?.message || 'Something went wrong. Please try again.'}`,
           time: new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })
         }])
         setLoading(false)
