@@ -45,16 +45,59 @@ app.use(cors(corsOptions))
 app.use(morgan('dev'))
 app.use(express.json({ limit: '10mb' }))
 
-// ── AI clients (lazy-loaded) ──────────────────────────────────────────────────
-function getGemini() {
-  if (!process.env.GEMINI_API_KEY) return null
-  const { GoogleGenerativeAI } = require('@google/generative-ai')
-  return new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
+// ── Log key presence on startup ───────────────────────────────────────────
+console.log('[Boot] GEMINI_API_KEY present:', !!process.env.GEMINI_API_KEY)
+console.log('[Boot] OPENAI_API_KEY present: ', !!process.env.OPENAI_API_KEY)
+
+// ── Gemini REST API (no npm package — uses built-in fetch, Node 18+) ──────────
+async function callGeminiREST(systemPrompt, history, userMessage) {
+  const apiKey = process.env.GEMINI_API_KEY
+  if (!apiKey) throw new Error('GEMINI_API_KEY is not set')
+
+  const url =
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`
+
+  // Build multi-turn contents array
+  const contents = [
+    ...history.slice(-6).map(h => ({
+      role: h.role === 'user' ? 'user' : 'model',
+      parts: [{ text: h.content }],
+    })),
+    { role: 'user', parts: [{ text: userMessage }] },
+  ]
+
+  const body = {
+    contents,
+    systemInstruction: { parts: [{ text: systemPrompt }] },
+    generationConfig: { temperature: 0.3, maxOutputTokens: 1200 },
+  }
+
+  const resp = await fetch(url, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify(body),
+  })
+
+  if (!resp.ok) {
+    const errBody = await resp.json().catch(() => ({}))
+    const msg = errBody?.error?.message || resp.statusText
+    throw new Error(`Gemini REST ${resp.status}: ${msg}`)
+  }
+
+  const data = await resp.json()
+  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text
+  if (!text) throw new Error('Gemini returned empty response')
+  return text
 }
 
-const openai = process.env.OPENAI_API_KEY
-  ? (() => { const OpenAI = require('openai'); return new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) })()
-  : null
+// ── OpenAI client (optional, kept for legacy) ───────────────────────────
+let openai = null
+if (process.env.OPENAI_API_KEY) {
+  try {
+    const OpenAI = require('openai')
+    openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+  } catch {}
+}
 
 // ── System prompt ─────────────────────────────────────────────────────────────
 function getSystemPrompt(category) {
@@ -132,8 +175,10 @@ app.get('/health', (req, res) => {
   })
 })
 
-// ── AI chat handler (Gemini → Pollinations → demo) ────────────────────────────
+// ── AI chat handler (Gemini REST → Pollinations → demo) ─────────────────────
 async function handleAiChat(req, res) {
+  console.log('[Chat] Request body:', JSON.stringify(req.body))
+
   const ip = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown'
   if (!rateLimit(ip)) {
     return res.status(429).json({ error: 'Rate limit exceeded. Please wait 1 minute.' })
@@ -148,58 +193,50 @@ async function handleAiChat(req, res) {
     return res.status(400).json({ error: 'Message too long (max 1000 characters).' })
   }
 
+  // Early check — log key status for every request
+  console.log('[Chat] GEMINI_API_KEY set:', !!process.env.GEMINI_API_KEY)
+
   const systemPrompt = getSystemPrompt(category)
   let reply = null
   let isDemo = false
   let engine = ''
 
-  // 1️⃣ Try Gemini
-  const gemini = getGemini()
-  if (gemini) {
+  // 1️⃣ Gemini REST API (no npm package required)
+  if (process.env.GEMINI_API_KEY) {
     try {
-      const model = gemini.getGenerativeModel({
-        model: 'gemini-1.5-flash',
-        systemInstruction: systemPrompt,
-      })
-      const chatHistory = history.slice(-6).map(h => ({
-        role: h.role === 'user' ? 'user' : 'model',
-        parts: [{ text: h.content }],
-      }))
-      const chat = model.startChat({ history: chatHistory })
-      const result = await chat.sendMessage(message)
-      reply = result.response.text()
+      reply = await callGeminiREST(systemPrompt, history, message)
       engine = 'gemini'
       console.log(`[AI] ✅ Gemini responded (${reply.length} chars)`)
     } catch (err) {
       console.error('[AI] ❌ Gemini failed:', err.message)
     }
   } else {
-    console.warn('[AI] ⚠️  GEMINI_API_KEY not set')
+    console.warn('[AI] ⚠️  GEMINI_API_KEY not set — skipping')
   }
 
-  // 2️⃣ Try OpenAI
+  // 2️⃣ OpenAI fallback
   if (!reply && openai) {
     try {
-      const messages = [
+      const msgs = [
         { role: 'system', content: systemPrompt },
         ...history.slice(-6).map(h => ({ role: h.role, content: h.content })),
         { role: 'user', content: message },
       ]
       const completion = await openai.chat.completions.create({
-        model: 'gpt-4o-mini', messages, max_tokens: 1200, temperature: 0.3,
+        model: 'gpt-4o-mini', messages: msgs, max_tokens: 1200, temperature: 0.3,
       })
       reply = completion.choices[0].message.content
       engine = 'openai'
-      console.log(`[AI] ✅ OpenAI responded`)
+      console.log('[AI] ✅ OpenAI responded')
     } catch (err) {
       console.error('[AI] ❌ OpenAI failed:', err.message)
     }
   }
 
-  // 3️⃣ Try Pollinations (free fallback)
+  // 3️⃣ Pollinations free fallback
   if (!reply) {
     try {
-      const messages = [
+      const msgs = [
         { role: 'system', content: systemPrompt },
         ...history.slice(-6).map(h => ({ role: h.role, content: h.content })),
         { role: 'user', content: message },
@@ -207,34 +244,35 @@ async function handleAiChat(req, res) {
       const pollRes = await fetch('https://text.pollinations.ai/', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages, model: 'openai' }),
+        body: JSON.stringify({ messages: msgs, model: 'openai' }),
       })
       if (pollRes.ok) {
         reply = await pollRes.text()
         engine = 'pollinations'
-        console.log(`[AI] ✅ Pollinations responded`)
+        console.log('[AI] ✅ Pollinations responded')
       } else {
-        throw new Error(`Pollinations ${pollRes.status}`)
+        throw new Error(`Pollinations ${pollRes.status}: ${pollRes.statusText}`)
       }
     } catch (err) {
       console.error('[AI] ❌ Pollinations failed:', err.message)
     }
   }
 
-  // 4️⃣ Demo fallback — always works
+  // 4️⃣ Demo fallback — always works, never 500
   if (!reply) {
     const demo = getDemoResponse(message, category)
     reply = demo.reply
     isDemo = true
     engine = 'demo'
-    console.log('[AI] ⚠️  Using demo response')
+    console.log('[AI] ⚠️  Using demo response (all engines unavailable)')
   }
 
+  console.log(`[Chat] Responding with engine=${engine} isDemo=${isDemo}`)
   return res.json({ reply, category, isDemo, engine, timestamp: new Date().toISOString() })
 }
 
 app.post('/api/chat', handleAiChat)
-app.post('/api/ask',  handleAiChat)  // alias used by some frontend versions
+app.post('/api/ask',  handleAiChat)  // alias
 
 // ── Categories endpoint ───────────────────────────────────────────────────────
 app.get('/api/categories', (req, res) => {
