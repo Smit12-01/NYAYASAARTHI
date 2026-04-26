@@ -286,6 +286,8 @@ export default function Emergency() {
     peersRef.current  = {}
     iceCacheRef.current = {}
     if (socketRef.current) {
+      // Clear keep-alive ping
+      if (socketRef.current._keepAlive) clearInterval(socketRef.current._keepAlive)
       socketRef.current.emit('livestream:end', { roomId: roomIdRef.current })
       socketRef.current.disconnect()
       socketRef.current = null
@@ -322,34 +324,53 @@ export default function Emergency() {
       // ── Step 3: Connect signaling server in background ───────────────────
       try { await fetch(`${SERVER_URL}/health`) } catch {}  // wake Render free tier
 
-      const socket = io(SERVER_URL, { transports: ['polling', 'websocket'] })
+      const socket = io(SERVER_URL, {
+        transports: ['polling', 'websocket'],
+        // Auto-reconnect so Render idle-timeout doesn't kill the session
+        reconnection:      true,
+        reconnectionDelay: 1000,
+        reconnectionAttempts: 20,
+      })
       socketRef.current = socket
 
       socket.on('connect_error', (err) => {
         console.error('[Signaling] connect error', err.message)
-        // Don't kill stream on signaling error — camera still works
         setSignalingReady(false)
       })
 
+      // ── KEY FIX: re-register the room on EVERY connect / reconnect ────────
       socket.on('connect', () => {
-        console.log('[Signaling] Connected, joining room', roomId)
-        socket.emit('livestream:join', { roomId })
-        setSignalingReady(true)  // mark ready on connect (works with old server too)
+        const rid = roomIdRef.current
+        console.log('[Signaling] Connected/reconnected, (re)joining room', rid)
+        socket.emit('livestream:join', { roomId: rid })
+        setSignalingReady(true)
       })
 
-      // New server: also responds with room-ready (no-op if already set above)
-      socket.on('livestream:room-ready', () => setSignalingReady(true))
+      socket.on('livestream:room-ready', () => {
+        console.log('[Signaling] Room confirmed ready on server ✅')
+        setSignalingReady(true)
+      })
+
+      // ── KEY FIX: keep-alive ping every 20s so Render never idles out ─────
+      const keepAlive = setInterval(() => {
+        if (socket.connected) {
+          socket.emit('ping')
+          console.log('[Signaling] keep-alive ping sent')
+        }
+      }, 20000)
 
       // ── Step 4: New viewer joined — create WebRTC offer ───────────────────
       socket.on('livestream:viewer-joined', async ({ viewerId }) => {
-        console.log('[WebRTC] Viewer joined:', viewerId)
+        console.log('[WebRTC] 👤 Viewer joined:', viewerId)
         setViewerCount(c => c + 1)
 
         const pc = new RTCPeerConnection(STUN)
         peersRef.current[viewerId] = pc
         iceCacheRef.current[viewerId] = []
 
-        stream.getTracks().forEach(track => pc.addTrack(track, stream))
+        localStreamRef.current.getTracks().forEach(track =>
+          pc.addTrack(track, localStreamRef.current)
+        )
 
         pc.onicecandidate = ({ candidate }) => {
           if (candidate) {
@@ -365,11 +386,12 @@ export default function Emergency() {
         const offer = await pc.createOffer()
         await pc.setLocalDescription(offer)
         socket.emit('livestream:offer', { roomId: roomIdRef.current, viewerId, offer })
-        console.log('[WebRTC] Offer sent to:', viewerId)
+        console.log('[WebRTC] 📤 Offer sent to viewer:', viewerId)
       })
 
       // ── Step 5: Viewer answered ───────────────────────────────────────────
       socket.on('livestream:answer', async ({ answer, viewerId }) => {
+        console.log('[WebRTC] 📥 Answer received from viewer:', viewerId)
         const pc = peersRef.current[viewerId]
         if (!pc) return
         await pc.setRemoteDescription(new RTCSessionDescription(answer))
@@ -392,10 +414,14 @@ export default function Emergency() {
         }
       })
 
-      socket.on('disconnect', () => {
-        console.log('[Signaling] Disconnected')
+      socket.on('disconnect', (reason) => {
+        console.log('[Signaling] Disconnected, reason:', reason)
         setSignalingReady(false)
+        // Socket.io will auto-reconnect; 'connect' handler re-registers room
       })
+
+      // Store keepAlive so stopLivestream can clear it
+      socketRef.current._keepAlive = keepAlive
 
     } catch (err) {
       console.error('[Livestream] error:', err)

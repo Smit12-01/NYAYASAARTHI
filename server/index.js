@@ -33,7 +33,11 @@ const corsOptions = {
 
 const server = http.createServer(app)
 const io     = new Server(server, {
-  cors: { origin: ALLOWED_ORIGINS, methods: ['GET', 'POST'], credentials: true }
+  cors: { origin: ALLOWED_ORIGINS, methods: ['GET', 'POST'], credentials: true },
+  // Keep connections alive on Render free tier (which kills idle sockets)
+  pingInterval: 10000,   // send ping every 10s
+  pingTimeout:  60000,   // wait 60s for pong before disconnecting
+  transports:   ['polling', 'websocket'],
 })
 
 // ── Middleware ────────────────────────────────────────────────────────────────
@@ -179,21 +183,31 @@ app.get('/api/categories', (req, res) => {
 // ── WebSocket chat (real-time streaming) ───────────────────────────────────────
 
 // Livestream rooms: roomId → { broadcasterId, viewerIds[] }
-const livestreamRooms = new Map()
+const livestreamRooms  = new Map()
 // Viewers who arrived before broadcaster: roomId → [{ socketId, timeout }]
-const pendingViewers  = new Map()
+const pendingViewers   = new Map()
+// Grace-period reconnect timers: roomId → timeoutHandle
+const reconnectTimers  = new Map()
 
 io.on('connection', (socket) => {
   console.log('[WS] Connected:', socket.id)
 
   // ── Livestream signaling ──────────────────────────────────────────────────
 
-  // Broadcaster creates a room
+  // Broadcaster creates / re-registers a room
   socket.on('livestream:join', ({ roomId }) => {
     if (!roomId) return
     socket.join(roomId)
+
+    // If this room had a pending reconnect timer, cancel it
+    if (reconnectTimers.has(roomId)) {
+      clearTimeout(reconnectTimers.get(roomId))
+      reconnectTimers.delete(roomId)
+      console.log(`[Livestream] Broadcaster reconnected for room ${roomId}`)
+    }
+
     livestreamRooms.set(roomId, { broadcasterId: socket.id, viewerIds: [] })
-    console.log(`[Livestream] Room created: ${roomId} by ${socket.id}`)
+    console.log(`[Livestream] ✅ Room registered: ${roomId} by broadcaster ${socket.id}`)
 
     // Notify any viewers who arrived early
     const pending = pendingViewers.get(roomId) || []
@@ -202,13 +216,11 @@ io.on('connection', (socket) => {
       const room = livestreamRooms.get(roomId)
       if (!room) return
       room.viewerIds.push(viewerId)
-      // Tell broadcaster about this waiting viewer
       socket.emit('livestream:viewer-joined', { viewerId })
       console.log(`[Livestream] Notified broadcaster of pending viewer ${viewerId}`)
     })
     pendingViewers.delete(roomId)
 
-    // Confirm room creation back to broadcaster
     socket.emit('livestream:room-ready', { roomId })
   })
 
@@ -325,19 +337,31 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', () => {
     console.log('[WS] Disconnected:', socket.id)
+
     for (const [roomId, room] of livestreamRooms.entries()) {
       if (room.broadcasterId === socket.id) {
-        socket.to(roomId).emit('livestream:ended')
-        livestreamRooms.delete(roomId)
-        // Also clear any still-pending viewers for this room
-        const pending = pendingViewers.get(roomId) || []
-        pending.forEach(({ timeoutHandle }) => clearTimeout(timeoutHandle))
-        pendingViewers.delete(roomId)
-        console.log(`[Livestream] Room ${roomId} auto-closed (broadcaster left)`)
+        // ── Grace period: wait 8s before closing room ──────────────────────
+        // Broadcaster may just be reconnecting (Render drops idle sockets)
+        console.log(`[Livestream] Broadcaster ${socket.id} disconnected — waiting 8s for reconnect (room: ${roomId})`)
+        const timer = setTimeout(() => {
+          // Check if broadcaster reconnected with the same roomId
+          const currentRoom = livestreamRooms.get(roomId)
+          if (currentRoom && currentRoom.broadcasterId === socket.id) {
+            io.to(roomId).emit('livestream:ended')
+            livestreamRooms.delete(roomId)
+            const pending = pendingViewers.get(roomId) || []
+            pending.forEach(({ timeoutHandle }) => clearTimeout(timeoutHandle))
+            pendingViewers.delete(roomId)
+            console.log(`[Livestream] Room ${roomId} closed after grace period`)
+          }
+          reconnectTimers.delete(roomId)
+        }, 8000)
+        reconnectTimers.set(roomId, timer)
       } else {
         room.viewerIds = room.viewerIds.filter(id => id !== socket.id)
       }
     }
+
     // Clean up if this was a pending viewer
     for (const [roomId, list] of pendingViewers.entries()) {
       const found = list.find(v => v.viewerId === socket.id)

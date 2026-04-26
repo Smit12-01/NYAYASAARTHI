@@ -48,24 +48,37 @@ export default function LivestreamViewer() {
     setStatusSafe('waking')
     fetch(`${SERVER_URL}/health`).catch(() => {}).finally(connect)
 
+    let keepAlive = null
+
     function connect() {
       setStatusSafe('connecting')
 
-      const socket = io(SERVER_URL, { transports: ['polling', 'websocket'] })
+      const socket = io(SERVER_URL, {
+        transports: ['polling', 'websocket'],
+        reconnection:        true,
+        reconnectionDelay:   1000,
+        reconnectionAttempts: 20,
+      })
       socketRef.current = socket
 
-      // Timeout: show error after 30s if stream never arrives
+      // 60s timeout — gives broadcaster time to start camera
       timeoutRef.current = setTimeout(() => {
         if (statusRef.current !== 'live') {
           setStatusSafe('error')
           setErrorMsg('No stream found. Make sure the broadcaster has started the camera and both devices are online.')
         }
-      }, 30000)
+      }, 60000)
 
+      // Re-join room on every connect/reconnect
       socket.on('connect', () => {
-        console.log('[Viewer] Socket connected, joining room:', roomId)
+        console.log('[Viewer] ✅ Socket connected, joining room:', roomId)
         socket.emit('livestream:viewer-join', { roomId })
       })
+
+      // Keep-alive ping every 20s
+      keepAlive = setInterval(() => {
+        if (socket.connected) socket.emit('ping')
+      }, 20000)
 
       socket.on('connect_error', (err) => {
         console.error('[Viewer] Socket error:', err.message)
@@ -75,7 +88,7 @@ export default function LivestreamViewer() {
       })
 
       socket.on('livestream:waiting', () => {
-        console.log('[Viewer] Waiting for broadcaster...')
+        console.log('[Viewer] ⏳ Waiting for broadcaster...')
         setStatusSafe('connecting')
       })
 
@@ -166,6 +179,7 @@ export default function LivestreamViewer() {
 
     return () => {
       clearTimeout(timeoutRef.current)
+      if (keepAlive) clearInterval(keepAlive)
       if (socketRef.current) { socketRef.current.disconnect(); socketRef.current = null }
       if (pcRef.current) { pcRef.current.close(); pcRef.current = null }
     }
