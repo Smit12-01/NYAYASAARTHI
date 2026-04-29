@@ -122,7 +122,7 @@ function rateLimit(ip, limit = 20, windowMs = 60000) {
   return rec.count <= limit
 }
 
-// ── Gemini REST API — no npm package, just fetch ───────────────────────────────
+// ── Gemini REST API — no npm package, just fetch ──────────────────────────────
 async function callGeminiREST(systemPrompt, history, userMessage) {
   const apiKey = process.env.GEMINI_API_KEY
   if (!apiKey) throw new Error('GEMINI_API_KEY is not set')
@@ -130,34 +130,44 @@ async function callGeminiREST(systemPrompt, history, userMessage) {
   const url =
     'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=' + apiKey
 
-  const contents = [
-    ...history.slice(-6).map(function(h) {
-      return {
-        role: h.role === 'user' ? 'user' : 'model',
-        parts: [{ text: h.content }],
-      }
-    }),
-    { role: 'user', parts: [{ text: userMessage }] },
-  ]
+  // Gemini requires: non-empty content, starts with 'user', alternating roles
+  var rawHistory = (history || []).filter(function(h) {
+    return h && h.content && typeof h.content === 'string' && h.content.trim().length > 0
+  })
 
-  const resp = await fetch(url, {
+  // Drop leading 'model' turns — Gemini rejects history that starts with model
+  while (rawHistory.length > 0 && rawHistory[0].role !== 'user') {
+    rawHistory.shift()
+  }
+
+  var contents = rawHistory.slice(-6).map(function(h) {
+    return {
+      role: h.role === 'user' ? 'user' : 'model',
+      parts: [{ text: h.content }],
+    }
+  })
+
+  // Always append the current user message
+  contents.push({ role: 'user', parts: [{ text: userMessage }] })
+
+  var resp = await fetch(url, {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       contents: contents,
       systemInstruction: { parts: [{ text: systemPrompt }] },
-      generationConfig:  { temperature: 0.3, maxOutputTokens: 1200 },
+      generationConfig:  { temperature: 0.3, maxOutputTokens: 2048 },
     }),
   })
 
   if (!resp.ok) {
-    const errBody = await resp.json().catch(function() { return {} })
-    const msg = (errBody && errBody.error && errBody.error.message) || resp.statusText
+    var errBody = await resp.json().catch(function() { return {} })
+    var msg = (errBody && errBody.error && errBody.error.message) || resp.statusText
     throw new Error('Gemini REST ' + resp.status + ': ' + msg)
   }
 
-  const data = await resp.json()
-  const text =
+  var data = await resp.json()
+  var text =
     data &&
     data.candidates &&
     data.candidates[0] &&
@@ -166,7 +176,11 @@ async function callGeminiREST(systemPrompt, history, userMessage) {
     data.candidates[0].content.parts[0] &&
     data.candidates[0].content.parts[0].text
 
-  if (!text) throw new Error('Gemini returned empty response')
+  if (!text) {
+    // Log full response to help debug safety blocks etc.
+    console.error('[Gemini] Unexpected response:', JSON.stringify(data).substring(0, 500))
+    throw new Error('Gemini returned empty/blocked response')
+  }
   return text
 }
 
@@ -174,7 +188,7 @@ async function callGeminiREST(systemPrompt, history, userMessage) {
 async function callPollinations(systemPrompt, history, userMessage) {
   const messages = [
     { role: 'system', content: systemPrompt },
-    ...history.slice(-6).map(function(h) { return { role: h.role, content: h.content } }),
+    ...history.slice(-6).map(function(h) { return { role: h.role === 'assistant' ? 'assistant' : 'user', content: h.content } }),
     { role: 'user', content: userMessage },
   ]
   const response = await fetch('https://text.pollinations.ai/', {
@@ -188,63 +202,14 @@ async function callPollinations(systemPrompt, history, userMessage) {
 
 // ── Main handler ───────────────────────────────────────────────────────────────
 module.exports = async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', 'https://nyayasaarthi.vercel.app')
+  // CORS — same-origin on Vercel, but set header for safety
+  res.setHeader('Access-Control-Allow-Origin', '*')
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS')
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
 
   if (req.method === 'OPTIONS') return res.status(200).end()
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
 
-  const ip = req.headers['x-forwarded-for'] || (req.socket && req.socket.remoteAddress) || 'unknown'
-  if (!rateLimit(ip)) {
-    return res.status(429).json({ error: 'Too many requests. Please wait 1 minute.' })
-  }
-
-  const body = req.body || {}
-  const message  = body.message
-  const category = body.category || 'fraud'
-  const history  = body.history  || []
-
-  console.log('[Chat] Request received — message:', message ? message.substring(0, 80) : 'MISSING')
-  console.log('[Chat] GEMINI_API_KEY present:', !!process.env.GEMINI_API_KEY)
-
-  if (!message || typeof message !== 'string' || message.trim().length === 0) {
-    return res.status(400).json({ error: 'Message is required.' })
-  }
-  if (message.length > 1000) {
-    return res.status(400).json({ error: 'Message too long (max 1000 characters).' })
-  }
-
-  const systemPrompt = getSystemPrompt(category)
-  let reply      = null
-  let isDemo     = false
-  let usedEngine = ''
-
-  // 1 — Gemini REST API (no npm package required)
-  if (process.env.GEMINI_API_KEY) {
-    try {
-      reply = await callGeminiREST(systemPrompt, history, message)
-      usedEngine = 'gemini'
-      console.log('[Chat] OK Gemini responded (' + reply.length + ' chars)')
-    } catch (err) {
-      console.error('[Chat] FAIL Gemini:', err.message)
-    }
-  } else {
-    console.warn('[Chat] SKIP Gemini — GEMINI_API_KEY not set')
-  }
-
-  // 2 — Pollinations free fallback
-  if (!reply) {
-    try {
-      reply = await callPollinations(systemPrompt, history, message)
-      usedEngine = 'pollinations'
-      console.log('[Chat] OK Pollinations responded (' + reply.length + ' chars)')
-    } catch (err) {
-      console.error('[Chat] FAIL Pollinations:', err.message)
-    }
-  }
-
-  // 3 — Demo response (always works, never 500)
   if (!reply) {
     reply = getDemoResponse(category)
     isDemo = true

@@ -1,10 +1,14 @@
-// aiService.js — routes all AI calls through /api/chat (Vercel serverless)
-// This avoids CORS issues with direct Pollinations calls from the browser.
+// aiService.js — routes all AI calls through backend /api/chat
+// API key is NEVER in the frontend — it lives only in server/.env
 
-const API_URL = '/api/chat'
+// In local dev: VITE_API_BASE_URL=http://localhost:3001
+// On Vercel:    VITE_API_BASE_URL=https://nyayabot-backend.onrender.com  (set in Vercel dashboard)
+// Fallback:     empty string → relative /api/chat (for Vercel serverless if ever needed)
+const BASE = import.meta.env.VITE_API_BASE_URL || ''
+const API_URL = `${BASE}/api/chat`
 
 /**
- * streamLegalQuery — calls /api/chat and simulates word-by-word streaming.
+ * streamLegalQuery — POSTs to backend /api/chat and simulates word-by-word streaming.
  */
 export async function streamLegalQuery({ message, category, history, onChunk, onEnd, onError }) {
   try {
@@ -14,9 +18,9 @@ export async function streamLegalQuery({ message, category, history, onChunk, on
       body: JSON.stringify({ message, category, history }),
     })
 
-    // Surface HTTP errors clearly
+    // Surface HTTP errors clearly with the actual server message
     if (!response.ok) {
-      let errMsg = `Server error: ${response.status}`
+      let errMsg = `Server error ${response.status}`
       try {
         const errBody = await response.json()
         if (errBody?.error) errMsg = errBody.error
@@ -40,6 +44,7 @@ export async function streamLegalQuery({ message, category, history, onChunk, on
     onEnd({
       fullReply: data.reply,
       isDemo:    data.isDemo   || false,
+      engine:    data.engine   || 'unknown',
       timestamp: data.timestamp || new Date().toISOString(),
     })
 

@@ -37,8 +37,32 @@ const HELPLINES = [
 ]
 
 /* ─── WebRTC config ─── */
-const STUN = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }] }
+const STUN = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
+  ]
+}
+
+// Always connect directly to the backend — never use Vite proxy.
+// This ensures LAN viewers (phones etc.) can also reach the signaling server.
 const SERVER_URL = import.meta.env.VITE_STREAM_SERVER_URL || 'https://nyayabot-backend.onrender.com'
+console.log('[Broadcaster] Backend URL:', SERVER_URL)
+
+// Build the viewer share link origin:
+// On localhost dev, use the real LAN IP so the link works on other devices.
+function getShareOrigin() {
+  if (window.location.hostname === 'localhost') {
+    try {
+      const ip = typeof __LOCAL_IP__ !== 'undefined' ? __LOCAL_IP__ : null
+      if (ip && ip !== 'localhost') {
+        return `${window.location.protocol}//${ip}:${window.location.port || 5173}`
+      }
+    } catch {}
+  }
+  return window.location.origin
+}
 
 /* ─── Map fly-to helper ─── */
 function MapFlyTo({ pos }) {
@@ -313,11 +337,15 @@ export default function Emergency() {
       }
       localStreamRef.current = stream
 
-      // ── Step 2: Generate link + show video IMMEDIATELY ───────────────────
+      // ── Step 2: Generate room ID + share link immediately ───────────────
       const roomId = crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2)
       roomIdRef.current = roomId
-      const link = `${window.location.origin}/livestream/${roomId}`
-      setStreamLink(link)   // link appears right away
+      console.log('[Broadcaster] Room ID:', roomId)
+
+      const shareOrigin = getShareOrigin()
+      const link = `${shareOrigin}/livestream/${roomId}`
+      console.log('[Broadcaster] Share link:', link)
+      setStreamLink(link)
       setStreaming(true)     // mounts the video element so useEffect can attach stream
       showToast('📷 Camera live! Share the link below.')
 
@@ -368,25 +396,39 @@ export default function Emergency() {
         peersRef.current[viewerId] = pc
         iceCacheRef.current[viewerId] = []
 
-        localStreamRef.current.getTracks().forEach(track =>
+        localStreamRef.current.getTracks().forEach(track => {
           pc.addTrack(track, localStreamRef.current)
-        )
+          console.log('[WebRTC] Added track:', track.kind)
+        })
 
         pc.onicecandidate = ({ candidate }) => {
           if (candidate) {
+            console.log('[WebRTC] Sending ICE to viewer:', viewerId, '| type:', candidate.type)
             socket.emit('livestream:ice-candidate', {
               roomId: roomIdRef.current, candidate, targetId: viewerId,
             })
+          } else {
+            console.log('[WebRTC] ICE gathering complete for viewer:', viewerId)
           }
         }
 
-        pc.onconnectionstatechange = () =>
-          console.log(`[WebRTC] Peer ${viewerId} → ${pc.connectionState}`)
+        pc.oniceconnectionstatechange = () =>
+          console.log(`[WebRTC] Viewer ${viewerId} ICE: ${pc.iceConnectionState}`)
 
-        const offer = await pc.createOffer()
-        await pc.setLocalDescription(offer)
-        socket.emit('livestream:offer', { roomId: roomIdRef.current, viewerId, offer })
-        console.log('[WebRTC] 📤 Offer sent to viewer:', viewerId)
+        pc.onconnectionstatechange = () => {
+          console.log(`[WebRTC] Viewer ${viewerId} connection: ${pc.connectionState}`)
+          if (pc.connectionState === 'connected') console.log('[WebRTC] P2P ESTABLISHED with viewer:', viewerId)
+          else if (pc.connectionState === 'failed') console.error('[WebRTC] P2P FAILED with viewer:', viewerId)
+        }
+
+        try {
+          const offer = await pc.createOffer()
+          await pc.setLocalDescription(offer)
+          console.log('[WebRTC] Offer created and sending to viewer:', viewerId)
+          socket.emit('livestream:offer', { roomId: roomIdRef.current, viewerId, offer })
+        } catch (offerErr) {
+          console.error('[WebRTC] Failed to create offer:', offerErr.message)
+        }
       })
 
       // ── Step 5: Viewer answered ───────────────────────────────────────────
@@ -424,11 +466,15 @@ export default function Emergency() {
       socketRef.current._keepAlive = keepAlive
 
     } catch (err) {
-      console.error('[Livestream] error:', err)
+      console.error('[Broadcaster] Fatal error:', err.name, err.message)
       if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
         setStreamError('Camera permission denied. Please allow camera access and try again.')
+      } else if (err.name === 'NotFoundError') {
+        setStreamError('No camera found on this device.')
+      } else if (err.name === 'NotReadableError') {
+        setStreamError('Camera is in use by another app. Close other apps using the camera.')
       } else {
-        setStreamError('Could not start camera: ' + err.message)
+        setStreamError(`Could not start camera: ${err.name} — ${err.message}`)
       }
       setStreaming(false)
     }
@@ -619,7 +665,7 @@ export default function Emergency() {
                         <p className="text-purple-300 text-xs font-mono break-all leading-relaxed">{streamLink}</p>
                       </div>
                       {/* Warn if localhost — won't work on other devices */}
-                      {window.location.hostname === 'localhost' && (
+                      {streamLink.includes('localhost') && (
                         <div className="mt-2 bg-amber-500/10 border border-amber-500/30 rounded-lg p-2.5">
                           <p className="text-amber-400 text-[10px] font-semibold mb-1">⚠️ Localhost detected</p>
                           <p className="text-amber-300/80 text-[10px] leading-relaxed">

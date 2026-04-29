@@ -1,7 +1,7 @@
 {
   "name": "nyayabot-server",
   "version": "1.0.0",
-  "description": "NyayaBot AI Legal Assistant - Node.js + Express Backend",
+  "description": "NyayaSaarthi AI Legal Assistant - Node.js + Express Backend",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
@@ -9,7 +9,7 @@
     "test": "echo \"No tests yet\" && exit 0"
   },
   "keywords": ["legal", "ai", "india", "nyayabot"],
-  "author": "NyayaBot Team",
+  "author": "NyayaSaarthi Team",
   "license": "MIT",
   "type": "commonjs",
   "dependencies": {

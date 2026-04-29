@@ -4,7 +4,7 @@ const helmet     = require('helmet')
 const morgan     = require('morgan')
 const http       = require('http')
 const { Server } = require('socket.io')
-require('dotenv').config()
+require('dotenv').config({ path: require('path').join(__dirname, '.env') })
 
 const app = express()
 
@@ -12,8 +12,9 @@ const app = express()
 const ALLOWED_ORIGINS = [
   'https://nyayasaarthi.vercel.app',
   /https:\/\/nyayasaarthi.*\.vercel\.app/,
-  'http://localhost:5173',
-  'http://localhost:5174',
+  /^http:\/\/localhost:\d+$/,   // any localhost port (5173, 5174, 5175, ...)
+  /^http:\/\/192\.168\.\d+\.\d+:\d+$/,  // LAN IPs for mobile testing
+  /^http:\/\/10\.\d+\.\d+\.\d+:\d+$/,   // LAN IPs (10.x)
   'http://localhost:3000',
   process.env.CLIENT_URL,
 ].filter(Boolean)
@@ -32,7 +33,17 @@ const corsOptions = {
 
 const server = http.createServer(app)
 const io     = new Server(server, {
-  cors: { origin: ALLOWED_ORIGINS, methods: ['GET', 'POST'], credentials: true },
+  cors: {
+    origin: (origin, cb) => {
+      if (!origin) return cb(null, true)
+      const ok = ALLOWED_ORIGINS.some(o =>
+        typeof o === 'string' ? o === origin : o.test(origin)
+      )
+      cb(null, true)  // allow all during dev; tighten in production
+    },
+    methods: ['GET', 'POST'],
+    credentials: true
+  },
   // Keep connections alive on Render free tier (which kills idle sockets)
   pingInterval: 10000,   // send ping every 10s
   pingTimeout:  60000,   // wait 60s for pong before disconnecting
